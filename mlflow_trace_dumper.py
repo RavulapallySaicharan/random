@@ -9,7 +9,7 @@ Usage:
     python mlflow_trace_dumper.py --mlflow_url <your_mlflow_url> [options]
 
 Example:
-    python mlflow_trace_dumper.py --mlflow_url http://localhost:5000 --output traces_dump.json
+    python mlflow_trace_dumper.py --mlflow_url https://ssds-dev-ingress.statestr.com/ssds/dev/rcd/01/snoaiobservability --output traces_dump.json
 """
 
 import argparse
@@ -104,6 +104,64 @@ class MLflowTraceDumper:
             logger.error(f"Failed to get runs for experiment {experiment_id}: {e}")
             return []
     
+    def get_traces_for_run(self, run_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all traces for a specific run.
+        
+        Args:
+            run_id: ID of the run
+            
+        Returns:
+            List of trace dictionaries
+        """
+        try:
+            # Try to get traces using the traces API endpoint
+            response = self.session.get(f"{self.mlflow_url}/api/2.0/mlflow/traces/search", params={"run_id": run_id})
+            if response.status_code == 200:
+                traces = response.json().get('traces', [])
+                logger.info(f"Found {len(traces)} traces for run {run_id}")
+                return traces
+            
+            # Fallback: try to get trace data from artifacts
+            artifacts_response = self.session.get(
+                f"{self.mlflow_url}/api/2.0/mlflow/artifacts/list",
+                params={"run_id": run_id}
+            )
+            
+            if artifacts_response.status_code == 200:
+                artifacts = artifacts_response.json().get('files', [])
+                traces = []
+                
+                for artifact in artifacts:
+                    if any(keyword in artifact.get('path', '').lower() for keyword in ['trace', 'langraph', 'agent']):
+                        try:
+                            artifact_response = self.session.get(
+                                f"{self.mlflow_url}/api/2.0/mlflow/artifacts/download",
+                                params={
+                                    "run_id": run_id,
+                                    "path": artifact['path']
+                                }
+                            )
+                            if artifact_response.status_code == 200:
+                                trace_content = artifact_response.text
+                                traces.append({
+                                    "trace_id": artifact['path'],
+                                    "content": trace_content,
+                                    "artifact_path": artifact['path'],
+                                    "size": len(trace_content)
+                                })
+                        except Exception as e:
+                            logger.warning(f"Failed to download trace artifact {artifact['path']}: {e}")
+                
+                logger.info(f"Found {len(traces)} trace artifacts for run {run_id}")
+                return traces
+            
+            return []
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get traces for run {run_id}: {e}")
+            return []
+    
     def get_trace_data(self, run_id: str) -> Optional[Dict[str, Any]]:
         """
         Get trace data for a specific run.
@@ -127,7 +185,8 @@ class MLflowTraceDumper:
                 "metrics": {},
                 "parameters": {},
                 "tags": {},
-                "artifacts": []
+                "artifacts": [],
+                "traces": []
             }
             
             # Get metrics
@@ -173,11 +232,71 @@ class MLflowTraceDumper:
                         except Exception as e:
                             logger.warning(f"Failed to download artifact {artifact['path']}: {e}")
             
+            # Get traces for this run
+            traces = self.get_traces_for_run(run_id)
+            trace_data["traces"] = traces
+            
             return trace_data
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get trace data for run {run_id}: {e}")
             return None
+    
+    def dump_experiment_traces(self, experiment_id: str, output_file: str = None) -> Dict[str, Any]:
+        """
+        Dump all traces from a specific experiment.
+        
+        Args:
+            experiment_id: ID of the experiment to dump
+            output_file: Optional file path to save the dump
+            
+        Returns:
+            Dictionary containing all trace data for the experiment
+        """
+        logger.info(f"Starting trace dump for experiment {experiment_id}...")
+        
+        experiment_traces = {
+            "metadata": {
+                "mlflow_url": self.mlflow_url,
+                "experiment_id": experiment_id,
+                "dump_timestamp": datetime.now().isoformat(),
+                "total_runs": 0,
+                "total_traces": 0
+            },
+            "runs": []
+        }
+        
+        # Get all runs for this experiment
+        runs = self.get_runs_for_experiment(experiment_id)
+        experiment_traces["metadata"]["total_runs"] = len(runs)
+        
+        for run in runs:
+            run_id = run['info']['run_id']
+            run_name = run['info'].get('run_name', 'Unknown')
+            
+            logger.info(f"Processing run: {run_name} (ID: {run_id})")
+            
+            trace_data = self.get_trace_data(run_id)
+            if trace_data:
+                run['trace_data'] = trace_data
+                experiment_traces["metadata"]["total_traces"] += len(trace_data.get('traces', []))
+            else:
+                run['trace_data'] = None
+            
+            experiment_traces["runs"].append(run)
+        
+        # Save to file if specified
+        if output_file:
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(experiment_traces, f, indent=2, ensure_ascii=False)
+                logger.info(f"Experiment trace dump saved to: {output_file}")
+            except Exception as e:
+                logger.error(f"Failed to save trace dump to file: {e}")
+        
+        logger.info(f"Experiment trace dump completed. Found {experiment_traces['metadata']['total_traces']} traces across {experiment_traces['metadata']['total_runs']} runs.")
+        
+        return experiment_traces
     
     def dump_all_traces(self, output_file: str = None) -> Dict[str, Any]:
         """
@@ -232,7 +351,7 @@ class MLflowTraceDumper:
                 trace_data = self.get_trace_data(run_id)
                 if trace_data:
                     run['trace_data'] = trace_data
-                    all_traces["metadata"]["total_traces"] += 1
+                    all_traces["metadata"]["total_traces"] += len(trace_data.get('traces', []))
                 else:
                     run['trace_data'] = None
             
@@ -256,6 +375,7 @@ def main():
     """Main function to run the MLflow trace dumper."""
     parser = argparse.ArgumentParser(description='Dump all traces from MLflow UI app')
     parser.add_argument('--mlflow_url', required=True, help='URL of the MLflow UI app')
+    parser.add_argument('--experiment_id', help='Specific experiment ID to dump (optional)')
     parser.add_argument('--username', help='Username for authentication (if required)')
     parser.add_argument('--password', help='Password for authentication (if required)')
     parser.add_argument('--output', default='mlflow_traces_dump.json', help='Output file path (default: mlflow_traces_dump.json)')
@@ -274,14 +394,20 @@ def main():
             password=args.password
         )
         
-        # Dump all traces
-        traces = dumper.dump_all_traces(output_file=args.output)
+        # Dump traces
+        if args.experiment_id:
+            # Dump specific experiment
+            traces = dumper.dump_experiment_traces(args.experiment_id, output_file=args.output)
+            print(f"\n=== Experiment Trace Dump Summary ===")
+            print(f"Experiment ID: {traces['metadata']['experiment_id']}")
+        else:
+            # Dump all traces
+            traces = dumper.dump_all_traces(output_file=args.output)
+            print(f"\n=== Trace Dump Summary ===")
+            print(f"Total experiments: {traces['metadata']['total_experiments']}")
         
-        # Print summary
-        print(f"\n=== Trace Dump Summary ===")
         print(f"MLflow URL: {traces['metadata']['mlflow_url']}")
         print(f"Dump timestamp: {traces['metadata']['dump_timestamp']}")
-        print(f"Total experiments: {traces['metadata']['total_experiments']}")
         print(f"Total runs: {traces['metadata']['total_runs']}")
         print(f"Total traces found: {traces['metadata']['total_traces']}")
         print(f"Output file: {args.output}")
